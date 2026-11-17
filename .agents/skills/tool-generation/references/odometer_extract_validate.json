@@ -1,0 +1,127 @@
+{
+  "name": "odometer_extract_validate",
+  "description": "Reads an odometer reading out of a photo the driver sent on WhatsApp: fetches the media, sends it to an OpenAI vision model, validates the extracted reading, uploads the image to S3, and sends the driver a templated message (the full computed prompt as one placeholder) asking them to reply CONFIRM, RETAKE or STOP. It never sends buttons — the odometer workflow routes the typed reply through the step finder, so the driver's own words (\"confirm\", \"looks right\", \"send again\", \"cancel\") are what choose the next step.\n\nReturns { success, stateParams, isValid, reading, unit, vehicleType, displayType, confidence, notes, capturedAt, mediaUrl, message }. `stateParams` is what the step engine stores as state.<stepId>, so a later step can read {{ state.step2.reading }}. Every key is always present, so a later step's binding never fails on an unresolved path.\n\nSTEP-ENGINE (v2) NOTE: declare \"successMode\": \"always\" on the step that calls this tool. `success` reports that the tool ran; whether a reading was found is `isValid`. An unreadable photo has already been answered with its own message, and treating it as a step failure would burn the retry ceiling and kill the flow after three blurry photos.",
+  "category": "generated",
+  "toolType": "CUSTOM",
+  "schema": {
+    "type": "object",
+    "required": ["phoneNumber", "messageBody", "employeeId", "accountId"],
+    "properties": {
+      "accountId": {
+        "type": "string",
+        "description": "The unique identifier for the Account"
+      },
+      "employeeId": {
+        "type": "string",
+        "description": "The unique identifier for the employee"
+      },
+      "messageBody": {
+        "type": "string",
+        "description": "The media ID of the odometer photo. Pass ONLY the media ID, with no prefix text."
+      },
+      "phoneNumber": {
+        "type": "string",
+        "description": "WhatsApp phone number of the driver (with country code)"
+      }
+    },
+    "additionalProperties": false
+  },
+  "workflowDefinition": {
+    "workflowName": "OdometerCaptureFlow",
+    "description": "Processes a WhatsApp photo containing an odometer: fetches the media, prepares a data URL, sends it to OpenAI for reading extraction, validates the result, sends a plain text confirm/retake/stop prompt, uploads the image to S3, and returns the extracted reading.",
+    "nodes": [
+      {
+        "id": "get_whatsapp_media",
+        "name": "Get WhatsApp Media",
+        "type": "tool",
+        "toolName": "get_whatsapp_media",
+        "toolParameters": {
+          "source": "$input.body.source",
+          "mediaId": "$input.body.messageBody"
+        }
+      },
+      {
+        "id": "prepare_data_url",
+        "name": "Prepare Data URL",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "function uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    var r = Math.random() * 16 | 0;\n    var v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nvar mediaData = $(\"get_whatsapp_media\") || {};\nvar mediaString = mediaData.mediaBuffer || (mediaData.data && mediaData.data.mediaBuffer);\nif (!mediaString) {\n  throw new Error('Missing mediaBuffer from get_whatsapp_media');\n}\n\nvar mimeType = mediaData.mimeType || (mediaData.data && mediaData.data.mimeType) || 'image/jpeg';\nvar fileExtension = mimeType.split('/')[1] || 'jpg';\nvar employeeId = ($input.body && $input.body.employeeId) || 'unknown-employee';\nvar folderName = 'customizable-workflows/odometer/' + employeeId;\nvar fileName = uuidv4() + '.' + fileExtension;\nvar dataUrl = 'data:' + mimeType + ';base64,' + mediaString;\n\nreturn { dataUrl: dataUrl, folderName: folderName, fileName: fileName, mimeType: mimeType };"
+      },
+      {
+        "id": "call_openai",
+        "name": "Call OpenAI Vision",
+        "type": "tool",
+        "toolName": "openai_chat_completion",
+        "toolParameters": {
+          "prompt": {
+            "model": "gpt-4.1-mini",
+            "messages": [
+              {
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Extract exact odometer reading from Indian vehicle dashboard images.\n\nCRITICAL ANALYSIS REQUIREMENTS:\n\nDIGITAL DISPLAYS:\n- Identify ALL visible digits in main odometer display\n- Look for decimal points or separators\n- Distinguish main odometer from trip meter (usually labeled)\n- Report only exact visible digits without interpolation\n\nANALOG DISPLAYS:\n- Examine each rotating number wheel individually from left to right\n- Read the topmost visible number on each wheel\n- For MOTORCYCLES: Report only the first 5 digits (ignore fractional 6th wheel)\n- For CARS/COMMERCIAL: Include fractional reading if clearly visible\n- White digits on black = full kilometers\n- Format: XXXXX (5 main digits for motorcycles)\n\nGENERAL RULES:\n- Assume kilometers for Indian vehicles unless clearly marked otherwise\n- Sanity check: motorcycles 1K-150K km, cars 5K-400K km, commercial up to 1M+ km\n- Never confuse trip meter with main odometer reading\n\nCONFIDENCE LEVELS:\n- HIGH: All required digits crystal clear, no estimation needed\n- MEDIUM: Minor blur but digits identifiable\n- LOW: Significant uncertainty, multiple unclear digits\n\nCRITICAL RESTRICTIONS:\n- NEVER guess or assume unclear digits\n- NEVER interpolate between damaged/worn numbers\n- NEVER round readings or add assumed decimals\n- NEVER make educated guesses on poor quality images\n\nUSE UNCLEAR WHEN:\n- ANY required digit is not clearly visible\n- Display is damaged, worn, or faded\n- Lighting/image quality prevents accurate reading\n- ANY doubt exists about specific digits\n\nUSE NO_ODOMETER WHEN:\n- No odometer display visible in image\n- Dashboard lacks odometer entirely\n\nREQUIRED JSON FORMAT:\n{\n  \"odometer\": {\n    \"reading\": \"exact numeric OR UNCLEAR/NO_ODOMETER\",\n    \"unit\": \"kilometers|miles|unknown\",\n    \"vehicle_type\": \"motorcycle|car|commercial|unknown\",\n    \"display_type\": \"analog|digital|mixed\",\n    \"confidence\": \"high|medium|low\",\n    \"sanity_check\": \"passed|questionable|failed\",\n    \"notes\": \"detailed observations about display condition, readability, etc.\"\n  }\n}\n\nEXAMPLES:\nMotorcycle analog: {\"odometer\":{\"reading\":\"47677\",\"unit\":\"kilometers\",\"vehicle_type\":\"motorcycle\",\"display_type\":\"analog\",\"confidence\":\"high\",\"notes\":\"First 5 digits clearly visible, fractional wheel ignored as per motorcycle standard\"}}\n\nCar with decimal: {\"odometer\":{\"reading\":\"45623.7\",\"unit\":\"kilometers\",\"vehicle_type\":\"car\",\"confidence\":\"high\",\"notes\":\"All digits clearly visible including fractional\"}}\n\nUnclear reading: {\"odometer\":{\"reading\":\"UNCLEAR\",\"unit\":\"unknown\",\"confidence\":\"low\",\"notes\":\"Heavy wear on number wheels, digits not readable\"}}\n\nREMEMBER: For motorcycles, focus only on the first 5 digits. Accuracy over completion. When uncertain, always use UNCLEAR rather than guessing."
+                  },
+                  {
+                    "type": "image_url",
+                    "image_url": {
+                      "url": "$prepare_data_url.dataUrl"
+                    }
+                  }
+                ]
+              }
+            ],
+            "response_format": {
+              "type": "json_object"
+            }
+          }
+        }
+      },
+      {
+        "id": "validate_odometer",
+        "name": "Validate Odometer And Compose Text Prompt",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "function parseOdometerReading(readingString) {\n  if (!readingString) return 0;\n  var cleanString = readingString.toString().replace(/[,\\s]/g, '');\n  var match = cleanString.match(/\\d+(\\.\\d+)?/);\n  return match ? parseFloat(match[0]) : 0;\n}\n\n// The v1 version of this tool answered with WhatsApp BUTTONS. The step engine's odometer\n// workflow deliberately asks for a TYPED reply instead, so the confirm/retake/stop decision is\n// made by the step finder from the driver's own words, never a button id. Everything below\n// composes the full prompt text here; the tool node sends it as the single {{TEXT}} placeholder\n// of a template (odometer_extract_validate__send_prompt) via send_template_message, not a free-text send.\nfunction buildPromptMessage(odometerData, failureReason) {\n  if (odometerData) {\n    var unitText = (!odometerData.unit || odometerData.unit === 'unknown') ? 'units' : odometerData.unit;\n    return '🚗 *Odometer reading detected*\\n\\n'\n      + '📊 *Reading:* ' + odometerData.reading + ' ' + unitText + '\\n'\n      + '🚙 *Vehicle:* ' + (odometerData.vehicleType || 'unknown') + '\\n'\n      + '🕒 *Captured:* ' + odometerData.capturedAt + '\\n\\n'\n      + 'Is this correct?\\n'\n      + 'Reply *CONFIRM* to save it, *RETAKE* to send another photo, or *STOP* to cancel.';\n  }\n  return '❌ *Could not read the odometer*\\n\\n'\n    + '🔍 ' + failureReason + '\\n\\n'\n    + 'Reply *RETAKE* to send another photo, or *STOP* to cancel.\\n'\n    + 'You can also just send a clearer photo straight away.';\n}\n\nfunction validateOdometerReading(parsedText) {\n  var result = { isValid: true, message: '', odometerData: null };\n\n  if (!parsedText || !parsedText.odometer) {\n    result.isValid = false;\n    result.message = 'That image does not appear to contain an odometer. Please send a photo of the odometer display.';\n    return result;\n  }\n\n  var odometer = parsedText.odometer;\n\n  if (odometer.reading === 'NO_ODOMETER') {\n    result.isValid = false;\n    result.message = 'No odometer display was found in the photo. Please send a clear photo of the odometer.';\n    return result;\n  }\n  if (odometer.reading === 'UNCLEAR') {\n    result.isValid = false;\n    result.message = 'The reading is not clear enough to read. Please send a clearer photo with better lighting and focus.';\n    return result;\n  }\n  if (!odometer.reading || odometer.reading === '') {\n    result.isValid = false;\n    result.message = 'No reading could be extracted from the photo. Please send a clear photo of the odometer display.';\n    return result;\n  }\n\n  var numericReading = parseOdometerReading(odometer.reading);\n  if (numericReading === 0 && odometer.reading !== '0' && odometer.reading !== '0.0') {\n    result.isValid = false;\n    result.message = 'The reading format could not be understood. Please make sure the odometer display is fully visible.';\n    return result;\n  }\n  if (numericReading < 0) {\n    result.isValid = false;\n    result.message = 'Invalid reading: negative values are not allowed.';\n    return result;\n  }\n  if (numericReading > 999999) {\n    result.isValid = false;\n    result.message = 'That reading looks unusually high. Please check the display and send a clearer photo.';\n    return result;\n  }\n  if (odometer.confidence === 'low') {\n    result.isValid = false;\n    result.message = 'The reading could not be extracted confidently. Please send a clearer, well-lit photo of the odometer.';\n    return result;\n  }\n\n  result.odometerData = {\n    reading: String(numericReading),\n    rawReading: String(odometer.reading),\n    unit: odometer.unit || 'kilometers',\n    vehicleType: odometer.vehicle_type || 'unknown',\n    displayType: odometer.display_type || 'unknown',\n    confidence: odometer.confidence || 'medium',\n    notes: odometer.notes || '',\n    capturedAt: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })\n  };\n  return result;\n}\n\nvar body = $input.body || {};\nvar phoneNumber = body.phoneNumber;\nvar source = body.source;\nvar emptyData = {\n  reading: '',\n  rawReading: '',\n  unit: '',\n  vehicleType: '',\n  displayType: '',\n  confidence: '',\n  notes: '',\n  capturedAt: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })\n};\n\nfunction respond(isValid, data, reason) {\n  var resolved = data || emptyData;\n  return {\n    isValid: isValid,\n    reading: resolved.reading,\n    rawReading: resolved.rawReading,\n    unit: resolved.unit,\n    vehicleType: resolved.vehicleType,\n    displayType: resolved.displayType,\n    confidence: resolved.confidence,\n    notes: resolved.notes,\n    capturedAt: resolved.capturedAt,\n    failureReason: isValid ? '' : reason,\n    phoneNumber: phoneNumber,\n    source: source,\n    message: buildPromptMessage(isValid ? resolved : null, reason)\n  };\n}\n\ntry {\n  var openaiResult = $(\"call_openai\") || {};\n  var choices = openaiResult.choices || (openaiResult.data && openaiResult.data.choices);\n  var content = (choices && choices.length && choices[0].message && choices[0].message.content) || '';\n\n  if (!content) {\n    return respond(false, null, 'The image could not be analysed. Please try again with a clearer photo.');\n  }\n\n  var parsedText;\n  try {\n    parsedText = typeof content === 'string' ? JSON.parse(content) : content;\n  } catch (parseError) {\n    return respond(false, null, 'The image could not be analysed. Please try again with a clearer photo.');\n  }\n\n  var validation = validateOdometerReading(parsedText);\n  return respond(validation.isValid, validation.odometerData, validation.message);\n} catch (error) {\n  return respond(false, null, 'Something went wrong while reading the photo. Please try again.');\n}"
+      },
+      {
+        "id": "send_prompt",
+        "name": "Send Confirm/Retake/Stop Text Message",
+        "type": "tool",
+        "toolName": "send_template_message",
+        "toolParameters": {
+          "phoneNumber": "$validate_odometer.phoneNumber",
+          "templateName": "odometer_extract_validate__send_prompt",
+          "parameters": {
+            "TEXT": "$validate_odometer.message"
+          }
+        }
+      },
+      {
+        "id": "upload_to_s3",
+        "name": "Upload Media To S3",
+        "type": "tool",
+        "toolName": "upload_mediaBuffer_to_s3",
+        "toolParameters": {
+          "FileName": "$prepare_data_url.fileName",
+          "folderName": "$prepare_data_url.folderName",
+          "bufferString": "$get_whatsapp_media.mediaBuffer"
+        }
+      },
+      {
+        "id": "build_final_response",
+        "name": "Build Final Response",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "var validation = $(\"validate_odometer\") || {};\nvar s3Result = $(\"upload_to_s3\") || {};\nvar mediaUrl = (s3Result.data && s3Result.data.mediaUrl) || s3Result.mediaUrl || '';\n\n// `success` reports that the tool RAN, not that a reading was found: the odometer workflow\n// declares \"successMode\": \"always\" on this step, so a photo that could not be read still moves\n// the driver on to the confirm/retake/stop question instead of burning the retry ceiling.\n// Whether a reading was actually extracted is carried by `isValid`, and odometer_record_reading\n// is the step that refuses to record without one.\nreturn {\n  success: true,\n  stateParams: {\n    isValid: validation.isValid === true,\n    reading: validation.reading || '',\n    unit: validation.unit || '',\n    vehicleType: validation.vehicleType || '',\n    confidence: validation.confidence || '',\n    capturedAt: validation.capturedAt || '',\n    mediaUrl: mediaUrl\n  },\n  isValid: validation.isValid === true,\n  reading: validation.reading || '',\n  rawReading: validation.rawReading || '',\n  unit: validation.unit || '',\n  vehicleType: validation.vehicleType || '',\n  displayType: validation.displayType || '',\n  confidence: validation.confidence || '',\n  notes: validation.notes || '',\n  capturedAt: validation.capturedAt || '',\n  failureReason: validation.failureReason || '',\n  mediaUrl: mediaUrl,\n  message: validation.message || ''\n};"
+      }
+    ]
+  },
+  "__annotations": {
+    "why_this_example_exists": "The canonical media→model→validate→persist graph: get_whatsapp_media first (the ONE tool the engine auto-retries), a code node building the data: URL for vision, an openai_chat_completion asking for response_format json_object, a code node that parses and RANGE-CHECKS the model's answer into an explicit isValid flag rather than trusting it, the outcome message sent from inside the tool as a single-placeholder template (odometer_extract_validate__send_prompt, body \"{{TEXT}}\") even though its text is fully computed and has no fixed skeleton, the S3 upload for evidence, and a result node returning the SAME stateParams keys on every path (empty strings on failure) so a later step's {{ state.step2.reading }} can never fail to bind. odometer_extract_validate__send_prompt has no spec action behind it either — this tool mints it in its own additionalTemplates.json, shown in references/mr_additional_templates.json.",
+    "success_mode_contract": "This tool returns success: true even when no reading could be read — an unreadable photo is an ANSWER, not a step failure. The calling step must declare \"successMode\": \"always\"; under the default lenient mode the top-level isValid: false would hard-fail the step, nothing would commit, and the driver would be left in silence on the previous step. Whether a reading exists is carried by stateParams.isValid, and odometer_record_reading is the step that refuses to record without it.",
+    "flat_result_note": "The result node is flat: success, stateParams, message and extra top-level fields, with no top-level `data`, `result` or `type` key. Any of those three would make normalizeToolResult unwrap the payload and read stateParams from inside it, handing the step an empty state slot while still reporting success.",
+    "shape_note": "A custom tool definition carries exactly name, description, category, toolType, schema and workflowDefinition, and workflowDefinition carries exactly workflowName, description and nodes. The production original of this tool also had accountId, endpoint, dataSources, category 'n8n' and a name/type/toolName pair inside workflowDefinition — all dead fields from the retired WEBHOOK era. Never emit them."
+  }
+}

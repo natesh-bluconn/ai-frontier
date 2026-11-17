@@ -1,0 +1,198 @@
+{
+  "name": "mr_save_request",
+  "description": "Saves a confirmed material request as a child entity of the requestor's site and notifies the approver. Validates the collected fields before writing; on validation failure it messages the requestor with the exact problem and returns success:false so the flow stays on the previous step (calling step should use successMode 'lenient'). stateParams always carries: requestEntityId, requestNumber, approverPhone (empty strings on failure). success:true means the record was written; the approver notify is best-effort and never fails the step.",
+  "category": "generated",
+  "toolType": "CUSTOM",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "phoneNumber": {
+        "type": "string",
+        "description": "Requestor's WhatsApp number"
+      },
+      "siteEntityId": {
+        "type": "string",
+        "description": "Entity id of the requestor's site (parent record), bound from state"
+      },
+      "materialName": {
+        "type": "string",
+        "description": "Material name collected earlier in the flow"
+      },
+      "quantity": {
+        "type": "string",
+        "description": "Quantity the requestor typed, as raw text — validated here"
+      },
+      "requestorName": {
+        "type": "string",
+        "description": "Requestor's display name from system context"
+      }
+    },
+    "required": ["phoneNumber", "siteEntityId", "materialName", "quantity", "requestorName"],
+    "additionalProperties": false
+  },
+  "workflowDefinition": {
+    "workflowName": "mr_save_request",
+    "description": "Parse and validate the collected request, look up the site for its approver, create the material-request entity under the site, then notify the approver only when one is configured.",
+    "nodes": [
+      {
+        "id": "parse_and_validate",
+        "name": "Parse input and validate quantity",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "const body = $input.body || {};\nconst quantityNumber = Number(String(body.quantity || '').replace(/[^0-9.]/g, ''));\nconst isValid = Number.isFinite(quantityNumber) && quantityNumber > 0 && quantityNumber <= 10000;\nreturn {\n  isValid: isValid,\n  quantityNumber: isValid ? quantityNumber : 0,\n  materialName: String(body.materialName || '').trim(),\n  siteEntityId: String(body.siteEntityId || ''),\n  phoneNumber: String(body.phoneNumber || ''),\n  requestorName: String(body.requestorName || ''),\n  requestNumber: 'MR-' + String(body.flowTrackingId || '').slice(-8).toUpperCase()\n};"
+      },
+      {
+        "id": "check_valid",
+        "name": "Save only when the quantity is valid",
+        "type": "if-else",
+        "condition": {
+          "left": "$parse_and_validate.isValid",
+          "operator": "==",
+          "right": true
+        },
+        "trueBranch": [
+          {
+            "id": "get_site",
+            "name": "Look up the site record",
+            "type": "tool",
+            "toolName": "get_entity",
+            "toolParameters": {
+              "accountId": "$input.body.accountId",
+              "entityId": "$parse_and_validate.siteEntityId"
+            }
+          },
+          {
+            "id": "read_site",
+            "name": "Check the lookup envelope and read the approver",
+            "type": "code",
+            "isIdempotent": true,
+            "code": "const r = $(\"get_site\");\nconst envelope = (r && r.data) || r || {};\nif (envelope.success === false || !envelope.entity) {\n  return { siteFound: false, approverPhone: '', siteName: '' };\n}\nconst site = envelope.entity.data || {};\nreturn {\n  siteFound: true,\n  approverPhone: String(site.approverPhone || ''),\n  siteName: String(site.siteName || '')\n};"
+          },
+          {
+            "id": "create_request",
+            "name": "Create the material request under the site",
+            "type": "tool",
+            "toolName": "create_entity",
+            "toolParameters": {
+              "accountId": "$input.body.accountId",
+              "entityTypeSlug": "material-request",
+              "parentId": "$parse_and_validate.siteEntityId",
+              "flowTrackingId": "$input.body.flowTrackingId",
+              "data": {
+                "requestNumber": "$parse_and_validate.requestNumber",
+                "materialName": "$parse_and_validate.materialName",
+                "quantity": "$parse_and_validate.quantityNumber",
+                "requestedBy": "$parse_and_validate.requestorName",
+                "status": "SUBMITTED"
+              }
+            }
+          },
+          {
+            "id": "check_create",
+            "name": "Check the create envelope",
+            "type": "code",
+            "isIdempotent": true,
+            "code": "const r = $(\"create_request\");\nconst envelope = (r && r.data) || r || {};\nreturn {\n  created: envelope.success === true && !!envelope.entityId,\n  entityId: String(envelope.entityId || ''),\n  createError: String(envelope.error || '')\n};"
+          },
+          {
+            "id": "saved_guard",
+            "name": "Only announce a request that was actually saved",
+            "type": "if-else",
+            "condition": {
+              "left": "$check_create.created",
+              "operator": "==",
+              "right": true
+            },
+            "trueBranch": [
+              {
+                "id": "build_confirmation",
+                "name": "Build the confirmation text",
+                "type": "code",
+                "isIdempotent": true,
+                "code": "// A $ reference must be the WHOLE string — \"Request $x saved\" is a literal, never interpolated.\n// So any composite message is assembled here and referenced as one value by the send node.\nconst parsed = $(\"parse_and_validate\") || {};\nconst site = $(\"read_site\") || {};\nreturn {\n  text: 'Request ' + (parsed.requestNumber || '') + ' for ' +\n        (parsed.quantityNumber || '') + ' x ' + (parsed.materialName || '') +\n        ' has been sent for approval' + (site.siteName ? ' at ' + site.siteName : '') + '.'\n};"
+              },
+              {
+                "id": "confirm_to_requestor",
+                "name": "Tell the requestor the request is in",
+                "type": "tool",
+                "toolName": "send_template_message",
+                "toolParameters": {
+                  "phoneNumber": "$input.body.phoneNumber",
+                  "templateName": "mr_save_request__confirm_to_requestor",
+                  "parameters": {
+                    "TEXT": "$build_confirmation.text"
+                  }
+                }
+              },
+              {
+                "id": "notify_guard",
+                "name": "Notify the approver only when one is configured",
+                "type": "if-else",
+                "condition": {
+                  "left": "$read_site.approverPhone",
+                  "operator": "exists",
+                  "right": null
+                },
+                "trueBranch": [
+                  {
+                    "id": "notify_approver",
+                    "name": "Send the approval request template",
+                    "type": "tool",
+                    "toolName": "send_template_message",
+                    "toolParameters": {
+                      "phoneNumber": "$read_site.approverPhone",
+                      "templateName": "mr_approval_request",
+                      "parameters": {
+                        "REQUEST_ID": "$parse_and_validate.requestNumber",
+                        "REQUESTOR_NAME": "$parse_and_validate.requestorName",
+                        "MATERIAL_LIST": "$parse_and_validate.materialName"
+                      },
+                      "buttonIds": ["approve_request__approve", "approve_request__reject"]
+                    }
+                  }
+                ],
+                "falseBranch": []
+              }
+            ],
+            "falseBranch": [
+              {
+                "id": "tell_save_failed",
+                "name": "Tell the requestor the save failed",
+                "type": "tool",
+                "toolName": "send_template_message",
+                "toolParameters": {
+                  "phoneNumber": "$input.body.phoneNumber",
+                  "templateName": "mr_save_request__tell_save_failed"
+                }
+              }
+            ]
+          }
+        ],
+        "falseBranch": [
+          {
+            "id": "tell_invalid",
+            "name": "Tell the requestor what was wrong",
+            "type": "tool",
+            "toolName": "send_template_message",
+            "toolParameters": {
+              "phoneNumber": "$input.body.phoneNumber",
+              "templateName": "mr_save_request__tell_invalid"
+            }
+          }
+        ]
+      },
+      {
+        "id": "build_final_response",
+        "name": "Build the result the engine reads",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "const parsed = $(\"parse_and_validate\") || {};\nif (!parsed.isValid) {\n  return {\n    success: false,\n    message: 'Quantity must be a number between 1 and 10000. Please send the quantity again.',\n    stateParams: { requestEntityId: '', requestNumber: '', approverPhone: '' }\n  };\n}\nconst createCheck = $(\"check_create\") || {};\nconst site = $(\"read_site\") || {};\nif (!createCheck.created) {\n  return {\n    success: false,\n    message: 'Sorry, we could not save your request right now. Please try again.',\n    stateParams: { requestEntityId: '', requestNumber: '', approverPhone: '' }\n  };\n}\nreturn {\n  success: true,\n  message: 'Material request ' + parsed.requestNumber + ' saved.',\n  stateParams: {\n    requestEntityId: createCheck.entityId,\n    requestNumber: parsed.requestNumber,\n    approverPhone: site.approverPhone || ''\n  }\n};"
+      }
+    ]
+  },
+  "__annotations": {
+    "why_this_example_exists": "Demonstrates the mandatory disciplines the SKILL.md describes: (1) validate BEFORE writing — the create_entity node lives inside the validation's trueBranch; (2) every platform result is envelope-checked in a code node before its fields are used (read_site, check_create); (3) the child entity carries parentId and flowTrackingId; (4) nothing announces success until check_create confirms the write landed — saved_guard wraps the confirmation and the notify, and its falseBranch tells the requestor instead of leaving them with a success message for a record that does not exist; (5) the third-party notify is wrapped in a further if-else on `exists` (false for empty string) so a site with no approver never crashes or messages nobody; (6) the result node is FLAT — success, message, stateParams, and no top-level `data`/`result`/`type` key that would make normalizeToolResult unwrap it and discard stateParams; (7) it returns the SAME stateParams keys on every path, chooses success deliberately, and sends the failure message from inside the tool because the engine sends nothing on failure; (8) isIdempotent true only on read/parse code nodes — the writes and sends are tool nodes and are never retried; (9) every send in this graph — confirmation, save-failure, invalid-input — goes through send_template_message, including the fully computed confirmation text, which uses a single-placeholder template (mr_save_request__confirm_to_requestor, body \"{{TEXT}}\") instead of a free-text send; (10) none of those three templates has a spec action behind it, so none exists in generatedTemplates — this tool's own additionalTemplates.json output mints all three, shown in references/mr_additional_templates.json.",
+    "whole_string_reference_note": "confirm_to_requestor's TEXT parameter is '$build_confirmation.text' — a reference must be the ENTIRE string, so 'Request $x saved' would be sent as that literal. Any composite text is assembled in a code node (build_confirmation) and referenced as one whole value, passed as the template's single placeholder parameter — templates do not require a fixed skeleton in the spec's text, a template can be just \"{{TEXT}}\". An unresolvable reference does not throw: it becomes undefined, and send_template_message reports it back as an \"Error: …\" string rather than throwing — check for that string, not an envelope.",
+    "branch_reference_note": "build_final_response references check_create and read_site, which only run in the trueBranch. That is safe ONLY because the code first checks parsed.isValid and returns before touching them on the false path — a $() call for a node that did not run returns {}, so guard before you read. Never reference a branching node itself (saved_guard, notify_guard): $() unwraps only tool and code nodes."
+  }
+}

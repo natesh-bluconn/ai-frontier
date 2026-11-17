@@ -1,0 +1,84 @@
+{
+  "version": "v2",
+  "triggerWord": "attendance",
+  "triggerCode": "46",
+  "start": "step1",
+
+  "defaults": {
+    "unexpectedTypeMessage": { "templateName": "attendance_unexpected_type" },
+    "onUnrelated": "step3"
+  },
+
+  "steps": {
+    "step1": {
+      "id": "step1",
+      "description": "Send the check-in/check-out template and wait for the button reply. The button id (CLOCK_IN / CLOCK_OUT) is captured directly as this step's logType.",
+      "tool": {
+        "name": "send_template_message",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "templateName": "attendance_checkin_checkout",
+          "buttonIds": ["CLOCK_IN", "CLOCK_OUT"]
+        }
+      },
+      "expects": { "messageTypes": ["button"] },
+      "router": {
+        "onButton": {
+          "CLOCK_IN": "step2",
+          "CLOCK_OUT": "step2"
+        }
+      }
+    },
+
+    "step2": {
+      "id": "step2",
+      "description": "Send the shift list built from the employee's real assigned shifts (system.shiftOptions, populated from AgentProcessParams.shiftDetails) and wait for the pick. This is the one case the pipeline does not template: the row COUNT varies per employee (some have 2 shifts, some 5), and a template's listSections is a fixed set of rows — nothing can add or remove one per send, so send_list_whatsapp_message stays here regardless of the all-templates rule. Any valid shift falls through to defaults.onUnrelated since the choice itself doesn't branch the flow. Each list item's id is the composite 'shiftId|shiftName' string; captureFields splits it back into state.step2.shiftId / state.step2.shiftName on the way out — no onButton map needed since the option ids are dynamic per employee.",
+      "tool": {
+        "name": "send_list_whatsapp_message",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "message": "Please select your shift:",
+          "buttonText": "Select Shift",
+          "listItems": "{{ system.shiftOptions }}"
+        }
+      },
+      "expects": { "messageTypes": ["button"] },
+      "captureFields": ["shiftId", "shiftName"],
+      "router": { "onButton": {} }
+    },
+
+    "step3": {
+      "id": "step3",
+      "description": "Ask for the current location and wait for the shared location. This is the other case the pipeline does not template: a location-share prompt needs messageType 'location', and no InteractiveType or template field can express that — so send_whatsapp_message stays here regardless of the all-templates rule. Location is a structural message kind, so it always advances via 'next' rather than a router.",
+      "tool": {
+        "name": "send_whatsapp_message",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "message": "📍 Please share your current location to mark your attendance.",
+          "messageType": "location"
+        }
+      },
+      "expects": { "messageTypes": ["location"] },
+      "unexpectedTypeMessage": "Please share your current location using WhatsApp's attachment (📎) button.",
+      "next": "step4"
+    },
+
+    "step4": {
+      "id": "step4",
+      "description": "Mark the attendance and end the flow. handle_location_message validates the shared location, persists the check-in/out, and sends its own confirmation message — no further step needed after this.",
+      "tool": {
+        "name": "handle_location_message",
+        "params": {
+          "senderPhone": "{{ input.phoneNumber }}",
+          "timestamp": "{{ system.currentDate }}",
+          "messageBody": "{{ input.text }}",
+          "logType": "{{ state.step1.value }}",
+          "workflowId": "{{ system.flowTrackingId }}",
+          "shiftId": "{{ state.step2.shiftId }}",
+          "shiftName": "{{ state.step2.shiftName }}"
+        }
+      },
+      "terminal": { "status": "COMPLETED" }
+    }
+  }
+}

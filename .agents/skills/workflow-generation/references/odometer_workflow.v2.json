@@ -1,0 +1,110 @@
+{
+  "version": "v2",
+  "triggerWord": "odometer",
+  "triggerCode": "45",
+  "start": "step1",
+  "defaults": {
+    "unexpectedTypeMessage": "Please reply with a text message: CONFIRM, RETAKE or STOP.",
+    "onUnrelated": "step3"
+  },
+  "steps": {
+    "step1": {
+      "id": "step1",
+      "description": "Ask for the odometer photo and wait for it. As a step-finder candidate this is the RETAKE branch — chosen when the driver wants to retake or replace the picture, or says the reading shown is wrong (retake, again, resend, wrong, one more photo, galat hai).",
+      "tool": {
+        "name": "send_template_message",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "templateName": "odometer_ask_photo"
+        }
+      },
+      "expects": {
+        "messageTypes": ["image"]
+      },
+      "unexpectedTypeMessage": "Please send a *photo* of the odometer display — not text, a voice note or a file.",
+      "next": "step2"
+    },
+    "step2": {
+      "id": "step2",
+      "description": "Extract the reading from the photo the driver just sent and ask them to reply CONFIRM, RETAKE or STOP as text. A new photo sent here re-enters this step, so resending a picture is itself a retake.",
+      "tool": {
+        "name": "odometer_extract_validate",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "messageBody": "{{ input.mediaId }}",
+          "employeeId": "{{ system.employeeId }}",
+          "accountId": "{{ system.accountId }}"
+        },
+        "successMode": "always"
+      },
+      "expects": {
+        "messageTypes": ["text", "image"]
+      },
+      "next": "step2",
+      "router": {
+        "onFreeform": {
+          "mode": "llm",
+          "candidates": ["step4", "step1", "step5"],
+          "onUnrelated": "step3"
+        }
+      }
+    },
+    "step3": {
+      "id": "step3",
+      "description": "Re-ask for a clear answer. Reached when the driver typed something that is neither a confirmation, a retake request nor a cancellation.",
+      "tool": {
+        "name": "send_template_message",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "templateName": "odometer_reask"
+        }
+      },
+      "expects": {
+        "messageTypes": ["text", "image"]
+      },
+      "next": "step2",
+      "router": {
+        "onFreeform": {
+          "mode": "llm",
+          "candidates": ["step4", "step1", "step5"],
+          "onUnrelated": "step3"
+        }
+      }
+    },
+    "step4": {
+      "id": "step4",
+      "description": "Record the confirmed reading and send the success message. As a step-finder candidate this is the CONFIRM branch — chosen when the driver agrees the reading shown is correct (confirm, yes, correct, right, ok, save it, theek hai, sahi hai).",
+      "tool": {
+        "name": "odometer_record_reading",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "reading": "{{ state.step2.reading }}",
+          "unit": "{{ state.step2.unit }}",
+          "vehicleType": "{{ state.step2.vehicleType }}",
+          "capturedAt": "{{ state.step2.capturedAt }}",
+          "mediaUrl": "{{ state.step2.mediaUrl }}",
+          "employeeId": "{{ system.employeeId }}",
+          "employeeName": "{{ system.employeeName }}",
+          "accountId": "{{ system.accountId }}"
+        }
+      },
+      "terminal": {
+        "status": "COMPLETED"
+      }
+    },
+    "step5": {
+      "id": "step5",
+      "description": "Acknowledge the cancellation and end the flow. As a step-finder candidate this is the STOP branch — chosen when the driver wants to abandon the odometer capture (stop, cancel, exit, quit, not now, leave it, rehne do).",
+      "tool": {
+        "name": "send_template_message",
+        "params": {
+          "phoneNumber": "{{ input.phoneNumber }}",
+          "templateName": "odometer_cancelled"
+        }
+      },
+      "terminal": {
+        "status": "STOPPED"
+      }
+    }
+  }
+}

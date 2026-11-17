@@ -1,0 +1,61 @@
+{
+  "templates": [
+    {
+      "key": "mr_save_request__confirm_to_requestor",
+      "languageCode": "EN",
+      "message": "{{TEXT}}",
+      "category": "OTHER",
+      "description": "Confirms a material request was saved. Body is a single placeholder — the confirmation text is fully computed at runtime (site name, quantity, material) and has no fixed skeleton in the spec.",
+      "interactiveType": "NONE",
+      "headerText": null,
+      "footer": null,
+      "listButtonText": null,
+      "buttons": null,
+      "listSections": null
+    },
+    {
+      "key": "mr_save_request__tell_save_failed",
+      "languageCode": "EN",
+      "message": "Sorry, we could not save your request right now. Please try again.",
+      "category": "OTHER",
+      "description": "Sent when create_entity does not confirm the write landed.",
+      "interactiveType": "NONE",
+      "headerText": null,
+      "footer": null,
+      "listButtonText": null,
+      "buttons": null,
+      "listSections": null
+    },
+    {
+      "key": "mr_save_request__tell_invalid",
+      "languageCode": "EN",
+      "message": "Quantity must be a number between 1 and 10000. Please send the quantity again.",
+      "category": "OTHER",
+      "description": "Sent when the confirmed quantity fails re-validation before the save is attempted.",
+      "interactiveType": "NONE",
+      "headerText": null,
+      "footer": null,
+      "listButtonText": null,
+      "buttons": null,
+      "listSections": null
+    },
+    {
+      "key": "odometer_extract_validate__send_prompt",
+      "languageCode": "EN",
+      "message": "{{TEXT}}",
+      "category": "OTHER",
+      "description": "Confirm/retake/stop prompt after an odometer photo is processed. Body is a single placeholder — the prompt text (reading, vehicle, confidence, or the unreadable-photo message) is fully computed and has no fixed skeleton in the spec.",
+      "interactiveType": "NONE",
+      "headerText": null,
+      "footer": null,
+      "listButtonText": null,
+      "buttons": null,
+      "listSections": null
+    }
+  ],
+  "unbuildable": [],
+  "__annotations": {
+    "why_this_example_exists": "Shows the additionalTemplates.json half of mr_save_request.json and odometer_extract_validate.json — every templateName those two tools reference that has no spec action behind it is minted here, in the exact reply shape template-generation itself uses. Keys follow the <tool_name>__<node_id> convention — distinct from template-generation's spec-driven <step_key>__<slug> keys, so the two can never collide.",
+    "single_placeholder_note": "mr_save_request__confirm_to_requestor and odometer_extract_validate__send_prompt are both body \"{{TEXT}}\" — nothing more. A template does not need a fixed skeleton in the spec's wording to exist; a fully computed message is still sent through send_template_message, just with the whole computed string as that one parameter."
+  }
+}

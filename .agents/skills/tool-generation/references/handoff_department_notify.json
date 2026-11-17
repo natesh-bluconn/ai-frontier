@@ -1,0 +1,148 @@
+{
+  "name": "fuel_issue_notify_department",
+  "description": "Handoff tool for a spec handoff whose recipientResolution.targetType is 'department' (the same shape covers 'branch'/'designation' — swap the table/field names). Resolves the department name to an id, fetches every ACTIVE employee in it, and notifies all of them (whenMultiple: 'notify_all') via send_bulk_template_message. When the department can't be resolved, or resolves to zero active employees, the requestor is told the spec's fallbackReply instead — nobody is left thinking the handoff went through silently. stateParams always carries: notified (boolean), recipientCount (number). success is always true: a message is guaranteed to reach someone (the department, or the requestor via the fallback), so this step never blocks the conversation — successMode 'always' in the calling step's contract.",
+  "category": "generated",
+  "toolType": "CUSTOM",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "phoneNumber": {
+        "type": "string",
+        "description": "Requestor's WhatsApp number, used only for the fallback message"
+      },
+      "issueNumber": {
+        "type": "string",
+        "description": "Reference number collected earlier in the flow, sent to the department"
+      },
+      "requestorName": {
+        "type": "string",
+        "description": "Requestor's display name from system context"
+      }
+    },
+    "required": ["phoneNumber", "issueNumber", "requestorName"],
+    "additionalProperties": false
+  },
+  "workflowDefinition": {
+    "workflowName": "fuel_issue_notify_department",
+    "description": "Resolve the 'Fuel' department by name, fetch its active employees, and bulk-notify them; fall back to telling the requestor when the department or its employees can't be found.",
+    "nodes": [
+      {
+        "id": "resolve_department",
+        "name": "Look up the Fuel department by name",
+        "type": "tool",
+        "toolName": "db_read_records",
+        "toolParameters": {
+          "tableName": "department",
+          "accountId": "$input.body.accountId",
+          "filters": { "name": { "equals": "Fuel", "mode": "insensitive" } },
+          "take": 1
+        }
+      },
+      {
+        "id": "check_department",
+        "name": "Check whether the department exists",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "const r = $(\"resolve_department\");\nconst rows = (r && r.data) || [];\nreturn {\n  departmentFound: rows.length > 0,\n  departmentId: rows.length > 0 ? String(rows[0].id || '') : ''\n};"
+      },
+      {
+        "id": "guard_department_found",
+        "name": "Only look up employees when the department resolved",
+        "type": "if-else",
+        "condition": {
+          "left": "$check_department.departmentFound",
+          "operator": "==",
+          "right": true
+        },
+        "trueBranch": [
+          {
+            "id": "fetch_employees",
+            "name": "Fetch active employees in the department",
+            "type": "tool",
+            "toolName": "db_read_records",
+            "toolParameters": {
+              "tableName": "employee",
+              "accountId": "$input.body.accountId",
+              "filters": {
+                "departmentId": "$check_department.departmentId",
+                "status": "ACTIVE"
+              },
+              "select": { "phoneNumber": true, "name": true }
+            }
+          },
+          {
+            "id": "check_employees",
+            "name": "Build the recipient list from the envelope",
+            "type": "code",
+            "isIdempotent": true,
+            "code": "const r = $(\"fetch_employees\");\nconst rows = (r && r.data) || [];\nconst recipients = rows\n  .filter(function (row) { return !!row.phoneNumber; })\n  .map(function (row) {\n    return { phoneNumber: row.phoneNumber, parameters: { EMPLOYEE_NAME: row.name || '' } };\n  });\nreturn { employeeCount: recipients.length, recipients: recipients };"
+          },
+          {
+            "id": "guard_employees_found",
+            "name": "Only bulk-notify when at least one employee matched",
+            "type": "if-else",
+            "condition": {
+              "left": "$check_employees.employeeCount",
+              "operator": ">",
+              "right": 0
+            },
+            "trueBranch": [
+              {
+                "id": "notify_department",
+                "name": "Bulk-notify every matching employee",
+                "type": "tool",
+                "toolName": "send_bulk_template_message",
+                "toolParameters": {
+                  "accountId": "$input.body.accountId",
+                  "recipients": "$check_employees.recipients",
+                  "templateName": "fuel_issue_handoff__notify_department",
+                  "parameters": {
+                    "ISSUE_NUMBER": "$input.body.issueNumber",
+                    "REQUESTOR_NAME": "$input.body.requestorName"
+                  }
+                }
+              }
+            ],
+            "falseBranch": [
+              {
+                "id": "notify_requestor_no_employees",
+                "name": "Tell the requestor nobody is in the department",
+                "type": "tool",
+                "toolName": "send_template_message",
+                "toolParameters": {
+                  "phoneNumber": "$input.body.phoneNumber",
+                  "templateName": "fuel_issue_handoff__nobody_found"
+                }
+              }
+            ]
+          }
+        ],
+        "falseBranch": [
+          {
+            "id": "notify_requestor_no_department",
+            "name": "Tell the requestor the department isn't configured",
+            "type": "tool",
+            "toolName": "send_template_message",
+            "toolParameters": {
+              "phoneNumber": "$input.body.phoneNumber",
+              "templateName": "fuel_issue_handoff__nobody_found"
+            }
+          }
+        ]
+      },
+      {
+        "id": "build_final_response",
+        "name": "Build the result the engine reads",
+        "type": "code",
+        "isIdempotent": true,
+        "code": "const departmentFound = ($(\"check_department\") || {}).departmentFound === true;\nconst employeesCheck = $(\"check_employees\") || {};\nconst notified = departmentFound && (employeesCheck.employeeCount || 0) > 0;\nreturn {\n  success: true,\n  message: notified\n    ? 'The Fuel department has been notified.'\n    : \"We couldn't find anyone in the Fuel department right now, but you've been told.\",\n  stateParams: {\n    notified: notified,\n    recipientCount: employeesCheck.employeeCount || 0\n  }\n};"
+      }
+    ]
+  },
+  "__annotations": {
+    "why_this_example_exists": "The worked pattern for recipientResolution.targetType 'department' (identical shape for 'branch'/'designation' — only the table name and the id field on employee change: branchId / designationId). Demonstrates: (1) resolve name -> id first, guard on zero rows before ever touching step 2 — a departmentId of '' would otherwise silently match employee rows with departmentId: null in some ORMs, which is exactly the kind of bug this two-step shape is written to avoid by being explicit; (2) whenMultiple: 'notify_all' maps to send_bulk_template_message, built from the SAME db_read_records shape used everywhere else in this registry — no bespoke org-chart tool was invented; (3) every branch — department not found, department found but empty, department found with matches — ends in exactly one message being sent, so the requestor is never left without an answer (the fallbackReply requirement in the spec schema exists precisely so this never gets skipped); (4) the result node is FLAT (success, message, stateParams, no top-level data/result/type) and returns success: true on every path, because a message always went somewhere — the calling step's contract must declare successMode: 'always'; 'notified' in stateParams is what a later step (or an audit trail) reads to know which outcome actually happened; (5) db_read_records' filters are a literal Prisma where clause — { name: { equals, mode: 'insensitive' } } and { departmentId, status } are passed through unmodified, accountId is a separate top-level param the tool merges in itself, never hand-added to filters.",
+    "notify_one_arbitrary_variant": "For recipientResolution.whenMultiple: 'notify_one_arbitrary', skip check_employees' recipients array and guard_employees_found's send_bulk_template_message branch; instead send_template_message directly to '$fetch_employees.data[0].phoneNumber' inside a single if-else guarding on employeeCount > 0, and record recipientCount as 0 or 1 in stateParams. Only use this variant once the spec has confirmed exactly one person is expected to hold that department/branch/designation.",
+    "manager_variant": "For recipientResolution.targetType 'manager', replace resolve_department/check_department/guard_department_found/fetch_employees/check_employees entirely with a single get_employee_manager_info tool node ({ phoneNumber: \"$input.body.phoneNumber\" }) followed by a code node reading success and managerDetails.managerPhoneNumber, then the same guard_employees_found-shaped if-else on whether a manager was found.",
+    "expected_validator_warning": "mcp__orchestrator__validate_tools warns that build_final_response's $(\"check_employees\") reference is inside guard_department_found.trueBranch and may not have run. This is deliberate, the same discipline mr_save_request.json's branch_reference_note documents: the code reads `$(\"check_employees\") || {}` and every field access goes through `|| 0`/`=== true`, so the false path (department never found) reads as employeeCount: 0, notified: false — exactly the fallback outcome, never a crash. Read every warning like this one and confirm the guard exists before accepting it; do not silence it by restructuring the graph."
+  }
+}
